@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol, TypeVar
 from urllib.parse import urljoin
 
 import httpx
-from pydantic import BaseModel
+from google import genai
+from google.genai import types
+from pydantic import BaseModel, ValidationError
 
 from seo_agent.audit.errors import (
     CollectionError,
+    ProviderConfigurationError,
     ProviderResponseError,
     ResourceTooLargeError,
 )
@@ -27,7 +31,6 @@ from seo_agent.audit.models import (
 from seo_agent.audit.url_policy import DnsResolver, UrlPolicy, UrlPolicyError, normalize_url
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
-
 
 _RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
@@ -345,6 +348,52 @@ class PageSpeedClient:
             )
 
 
+class GeminiStructuredClient:
+    """Google Gen AI structured-output adapter."""
+
+    def __init__(self, *, api_key: str | None, model: str) -> None:
+        if not api_key:
+            raise ProviderConfigurationError("Gemini is not configured")
+        self._client = genai.Client(api_key=api_key)
+        self._model = model
+
+    async def generate(
+        self,
+        output_model: type[ModelT],
+        *,
+        task: str,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> ModelT:
+        """Generate and validate a Pydantic structured response."""
+        del task  # Task names support fakes/telemetry without entering prompt data.
+        try:
+            response = await self._client.aio.models.generate_content(
+                model=self._model,
+                contents=user_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    response_mime_type="application/json",
+                    response_json_schema=output_model.model_json_schema(),
+                    temperature=0.1,
+                ),
+            )
+            if response.parsed is not None:
+                return output_model.model_validate(response.parsed)
+            if response.text:
+                return output_model.model_validate_json(response.text)
+        except (ValidationError, ValueError, TypeError) as exc:
+            raise ProviderResponseError("Gemini returned invalid structured output") from exc
+        except Exception as exc:  # Google SDK exposes several transport-specific exceptions.
+            raise ProviderResponseError(_safe_provider_failure("Gemini", exc)) from exc
+        raise ProviderResponseError("Gemini returned no structured output")
+
+    async def close(self) -> None:
+        """Release both async and sync SDK transports."""
+        await self._client.aio.aclose()
+        self._client.close()
+
+
 def _parse_pagespeed(
     url: str,
     strategy: PageSpeedStrategy,
@@ -410,3 +459,11 @@ def _parse_pagespeed(
         field_metrics=field_metrics,
         diagnostics=diagnostics,
     )
+
+
+def _safe_provider_failure(provider: str, error: Exception) -> str:
+    """Expose only a provider status code/category, never request or credential details."""
+    match = re.search(r"\b([45]\d\d)\s+([A-Z_]+)\b", str(error))
+    if match:
+        return f"{provider} request failed ({match.group(1)} {match.group(2)})"
+    return f"{provider} request failed"

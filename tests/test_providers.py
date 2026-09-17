@@ -6,8 +6,8 @@ import httpx
 import pytest
 
 from seo_agent.audit.errors import CollectionError, ResourceTooLargeError
-from seo_agent.audit.models import AuditLimits
-from seo_agent.audit.providers import PageSpeedClient, SafeHttpFetcher
+from seo_agent.audit.models import AuditLimits, PageSelectionResult
+from seo_agent.audit.providers import GeminiStructuredClient, PageSpeedClient, SafeHttpFetcher
 from seo_agent.audit.url_policy import UrlPolicy
 
 
@@ -150,3 +150,62 @@ async def test_pagespeed_client_distinguishes_timeout_from_other_failures() -> N
 
     assert result.available is False
     assert result.collection_error == "PageSpeed request timed out after 45 seconds"
+
+
+@pytest.mark.unit
+async def test_gemini_client_uses_standard_json_schema_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_config: dict[str, object] = {}
+
+    class CapturingConfig:
+        def __init__(self, **kwargs: object) -> None:
+            captured_config.update(kwargs)
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.parsed: dict[str, list[object]] = {"selected_pages": []}
+            self.text: str | None = None
+
+    class FakeModels:
+        async def generate_content(self, **_kwargs: object) -> FakeResponse:
+            return FakeResponse()
+
+    class FakeAsyncClient:
+        models = FakeModels()
+
+        async def aclose(self) -> None:
+            return None
+
+    class FakeClient:
+        aio = FakeAsyncClient()
+
+        def close(self) -> None:
+            return None
+
+    fake_client = FakeClient()
+
+    def make_fake_client(*, api_key: str) -> FakeClient:
+        del api_key
+        return fake_client
+
+    monkeypatch.setattr(
+        "seo_agent.audit.providers.genai.Client",
+        make_fake_client,
+    )
+    monkeypatch.setattr(
+        "seo_agent.audit.providers.types.GenerateContentConfig",
+        CapturingConfig,
+    )
+
+    provider = GeminiStructuredClient(api_key="test-key", model="test-model")
+    result = await provider.generate(
+        PageSelectionResult,
+        task="select_pages",
+        system_prompt="system",
+        user_prompt="user",
+    )
+
+    assert isinstance(result, PageSelectionResult)
+    assert captured_config["response_json_schema"] == PageSelectionResult.model_json_schema()
+    assert "response_schema" not in captured_config
