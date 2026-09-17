@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol, TypeVar
@@ -11,9 +12,14 @@ from urllib.parse import urljoin
 import httpx
 from pydantic import BaseModel
 
-from seo_agent.audit.errors import CollectionError, ResourceTooLargeError
+from seo_agent.audit.errors import (
+    CollectionError,
+    ProviderResponseError,
+    ResourceTooLargeError,
+)
 from seo_agent.audit.models import (
     AuditLimits,
+    PageSpeedMetric,
     PageSpeedStrategy,
     PageSpeedSummary,
     RedirectHop,
@@ -22,8 +28,16 @@ from seo_agent.audit.url_policy import DnsResolver, UrlPolicy, UrlPolicyError, n
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
+
 _RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_LAB_AUDITS = {
+    "first-contentful-paint": ("first_contentful_paint", "ms"),
+    "largest-contentful-paint": ("largest_contentful_paint", "ms"),
+    "cumulative-layout-shift": ("cumulative_layout_shift", "score"),
+    "speed-index": ("speed_index", "ms"),
+    "total-blocking-time": ("total_blocking_time", "ms"),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,3 +237,176 @@ class SafeHttpFetcher:
                 raise ResourceTooLargeError("Website response exceeded the configured size limit")
             body.extend(chunk)
         return bytes(body)
+
+
+class FirecrawlRenderer:
+    """Selective Firecrawl v2 renderer; ordinary HTTP remains the evidence source."""
+
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        api_key: str | None,
+        timeout_seconds: float,
+        max_response_bytes: int,
+    ) -> None:
+        self._client = client
+        self._api_key = api_key
+        self._timeout_seconds = timeout_seconds
+        self._max_response_bytes = max_response_bytes
+
+    async def render(self, url: str, policy: UrlPolicy) -> str | None:
+        """Return rendered HTML only when Firecrawl is configured."""
+        if not self._api_key:
+            return None
+        target_url = await policy.validate_for_fetch(url)
+        try:
+            response = await self._client.post(
+                "https://api.firecrawl.dev/v2/scrape",
+                headers={"authorization": f"Bearer {self._api_key}"},
+                json={"url": target_url, "formats": ["html"], "onlyMainContent": False},
+                timeout=self._timeout_seconds,
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise ProviderResponseError("Rendered-page provider request failed") from exc
+        if len(response.content) > self._max_response_bytes:
+            raise ResourceTooLargeError("Rendered-page response exceeded the configured size limit")
+        try:
+            payload = response.json()
+            html = payload["data"]["html"]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ProviderResponseError("Rendered-page provider returned invalid data") from exc
+        if not isinstance(html, str):
+            raise ProviderResponseError("Rendered-page provider returned invalid HTML")
+        return html
+
+
+class PageSpeedClient:
+    """Compact PageSpeed Insights v5 client."""
+
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        api_key: str | None,
+        timeout_seconds: float,
+    ) -> None:
+        self._client = client
+        self._api_key = api_key
+        self._timeout_seconds = timeout_seconds
+
+    async def measure(
+        self,
+        url: str,
+        policy: UrlPolicy,
+        strategy: PageSpeedStrategy = PageSpeedStrategy.MOBILE,
+    ) -> PageSpeedSummary:
+        """Measure a validated URL and discard the full API response."""
+        target_url = await policy.validate_for_fetch(url)
+        params: dict[str, str] = {
+            "url": target_url,
+            "strategy": strategy.value,
+            "category": "performance",
+        }
+        if self._api_key:
+            params["key"] = self._api_key
+        try:
+            response = await self._client.get(
+                "https://pagespeedonline.googleapis.com/pagespeedonline/v5/runPagespeed",
+                params=params,
+                timeout=self._timeout_seconds,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            return _parse_pagespeed(target_url, strategy, payload)
+        except httpx.TimeoutException:
+            return PageSpeedSummary(
+                url=target_url,
+                strategy=strategy,
+                available=False,
+                collection_error=(
+                    f"PageSpeed request timed out after {self._timeout_seconds:g} seconds"
+                ),
+            )
+        except httpx.HTTPStatusError as exc:
+            return PageSpeedSummary(
+                url=target_url,
+                strategy=strategy,
+                available=False,
+                collection_error=f"PageSpeed request failed (HTTP {exc.response.status_code})",
+            )
+        except (httpx.HTTPError, TypeError, ValueError, KeyError):
+            return PageSpeedSummary(
+                url=target_url,
+                strategy=strategy,
+                available=False,
+                collection_error="PageSpeed measurement was unavailable",
+            )
+
+
+def _parse_pagespeed(
+    url: str,
+    strategy: PageSpeedStrategy,
+    payload: object,
+) -> PageSpeedSummary:
+    if not isinstance(payload, dict):
+        raise TypeError("PageSpeed payload must be an object")
+    lighthouse = payload.get("lighthouseResult")
+    if not isinstance(lighthouse, dict):
+        raise KeyError("lighthouseResult")
+    categories = lighthouse.get("categories")
+    audits = lighthouse.get("audits")
+    if not isinstance(categories, dict) or not isinstance(audits, dict):
+        raise KeyError("PageSpeed categories or audits")
+    performance = categories.get("performance")
+    score: float | None = None
+    if isinstance(performance, dict) and isinstance(performance.get("score"), int | float):
+        score = float(performance["score"])
+
+    lab_metrics: list[PageSpeedMetric] = []
+    for audit_key, (name, unit) in _LAB_AUDITS.items():
+        audit = audits.get(audit_key)
+        if not isinstance(audit, dict):
+            continue
+        value = audit.get("numericValue")
+        if isinstance(value, int | float):
+            lab_metrics.append(PageSpeedMetric(name=name, value=float(value), unit=unit))
+
+    field_metrics: list[PageSpeedMetric] = []
+    loading_experience = payload.get("loadingExperience")
+    if isinstance(loading_experience, dict):
+        metrics = loading_experience.get("metrics")
+        if isinstance(metrics, dict):
+            for name, metric in metrics.items():
+                if not isinstance(name, str) or not isinstance(metric, dict):
+                    continue
+                percentile = metric.get("percentile")
+                if isinstance(percentile, int | float):
+                    field_metrics.append(
+                        PageSpeedMetric(
+                            name=name.lower(), value=float(percentile), unit="percentile"
+                        )
+                    )
+
+    diagnostics: list[str] = []
+    for audit in audits.values():
+        if not isinstance(audit, dict):
+            continue
+        details = audit.get("details")
+        savings = details.get("overallSavingsMs") if isinstance(details, dict) else None
+        title = audit.get("title")
+        if isinstance(savings, int | float) and savings > 100 and isinstance(title, str):
+            diagnostics.append(title)
+        if len(diagnostics) == 5:
+            break
+
+    return PageSpeedSummary(
+        url=url,
+        strategy=strategy,
+        available=True,
+        performance_score=score,
+        lab_metrics=lab_metrics,
+        field_metrics=field_metrics,
+        diagnostics=diagnostics,
+    )
