@@ -4,19 +4,28 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import Iterable, Mapping
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel
 
+from seo_agent.audit.checks import consolidate_findings, run_deterministic_checks
 from seo_agent.audit.errors import AuditError
 from seo_agent.audit.extraction import extract_page_signals, parse_robots_txt, parse_sitemap_xml
 from seo_agent.audit.models import (
+    AnalysisResult,
     AuditState,
     CandidateSource,
+    CollectionStatus,
+    Finding,
     PageCandidate,
     PageSelectionResult,
     PageSignals,
+    PageSpeedStrategy,
+    PageSpeedSummary,
+    RobotsDirective,
+    RobotsSignals,
     SelectedPage,
     SiteContext,
     SiteFileSignals,
@@ -24,6 +33,8 @@ from seo_agent.audit.models import (
     SiteSignals,
 )
 from seo_agent.audit.prompts import (
+    ANALYZE_FINDINGS_SYSTEM_PROMPT,
+    ANALYZE_FINDINGS_USER_PROMPT,
     SELECT_PAGES_SYSTEM_PROMPT,
     SELECT_PAGES_USER_PROMPT,
     UNDERSTAND_SITE_SYSTEM_PROMPT,
@@ -235,6 +246,147 @@ class AuditWorkflowNodes:
             ),
         }
 
+    async def fetch_and_extract(self, state: AuditState) -> StateUpdate:
+        """Fetch selected pages once and retain only compact signals."""
+        _, policy = await UrlPolicy.for_url(
+            state["website_url"], resolver=self._dependencies.resolver
+        )
+        page_signals = dict(state["page_signals"])
+        warnings: list[str] = []
+
+        async def collect(page: SelectedPage) -> tuple[str, PageSignals | None, str | None]:
+            if page.url in page_signals:
+                return page.url, page_signals[page.url], None
+            robots = state["site_signals"].robots if state["site_signals"] else None
+            if not _robots_permits(page.url, robots):
+                blocked = PageSignals(
+                    url=page.url,
+                    collection_status=CollectionStatus.FAILED,
+                    collection_error="Collection skipped because robots.txt disallows this URL",
+                )
+                return page.url, blocked, f"Page {page.url}: blocked by robots.txt"
+            try:
+                resource = await self._dependencies.fetcher.fetch(page.url, policy)
+                signals = _extract_resource(resource, policy)
+                if (
+                    signals.status_code is not None
+                    and 200 <= signals.status_code < 300
+                    and not signals.page_context
+                ):
+                    rendered = await self._dependencies.renderer.render(page.url, policy)
+                    if rendered:
+                        signals = extract_page_signals(
+                            url=resource.requested_url,
+                            html=rendered,
+                            status_code=resource.status_code,
+                            headers=resource.headers,
+                            final_url=resource.final_url,
+                            redirect_chain=resource.redirect_chain,
+                            scope=policy.scope,
+                        )
+                return page.url, signals, None
+            except (AuditError, UrlPolicyError) as exc:
+                failed = PageSignals(
+                    url=page.url,
+                    collection_status=CollectionStatus.FAILED,
+                    collection_error="Selected page collection failed",
+                )
+                return page.url, failed, f"Page {page.url}: {type(exc).__name__}"
+
+        results = await asyncio.gather(*(collect(page) for page in state["selected_pages"]))
+        for page_url, signals, warning in results:
+            if signals is not None:
+                page_signals[page_url] = signals
+            if warning:
+                warnings.append(warning)
+        return {
+            "page_signals": page_signals,
+            "collection_warnings": _merge_strings(state["collection_warnings"], warnings),
+        }
+
+    async def run_technical_audit(self, state: AuditState) -> StateUpdate:
+        """Apply deterministic checks and collect bounded performance evidence."""
+        page_signals = _attach_verified_link_statuses(state["page_signals"])
+        limits = state["limits"]
+        _, policy = await UrlPolicy.for_url(
+            state["website_url"], resolver=self._dependencies.resolver
+        )
+        performance: dict[str, PageSpeedSummary] = {}
+        warnings: list[str] = []
+        robots = state["site_signals"].robots if state["site_signals"] else None
+        pagespeed_pages = [
+            page for page in state["selected_pages"] if _robots_permits(page.url, robots)
+        ][: limits.max_pagespeed_pages]
+
+        async def measure(page: SelectedPage) -> tuple[str, PageSpeedSummary]:
+            summary = await self._dependencies.pagespeed.measure(
+                page.url, policy, PageSpeedStrategy.MOBILE
+            )
+            return page.url, summary
+
+        results = await asyncio.gather(*(measure(page) for page in pagespeed_pages))
+        for page_url, summary in results:
+            performance[page_url] = summary
+            if not summary.available:
+                warnings.append(
+                    f"PageSpeed unavailable for {page_url}: "
+                    f"{summary.collection_error or 'unknown provider error'}"
+                )
+
+        findings = run_deterministic_checks(page_signals, state["site_signals"])
+        return {
+            "page_signals": page_signals,
+            "performance": performance,
+            "findings": findings,
+            "collection_warnings": _merge_strings(state["collection_warnings"], warnings),
+        }
+
+    def consolidate(self, state: AuditState) -> StateUpdate:
+        """Combine technically identical observations before LLM reasoning."""
+        return {"findings": consolidate_findings(state["findings"])}
+
+    async def analyze_findings(self, state: AuditState) -> StateUpdate:
+        """Add contextual interpretation without changing evidence."""
+        if not state["findings"]:
+            return {"findings": []}
+        prompt = ANALYZE_FINDINGS_USER_PROMPT.format(
+            site_context=_json_data(state["site_context"]),
+            findings=_json_data(state["findings"]),
+            performance=_json_data(state["performance"]),
+        )
+        try:
+            result = await self._dependencies.llm.generate(
+                AnalysisResult,
+                task="analyze_findings",
+                system_prompt=ANALYZE_FINDINGS_SYSTEM_PROMPT,
+                user_prompt=prompt,
+            )
+        except AuditError as exc:
+            return {
+                "collection_warnings": _merge_strings(
+                    state["collection_warnings"],
+                    [f"Finding analysis was unavailable ({exc})"],
+                )
+            }
+        analyses = {analysis.finding_id: analysis for analysis in result.analyses}
+        findings: list[Finding] = []
+        for finding in state["findings"]:
+            analysis = analyses.get(finding.id)
+            if analysis is None:
+                findings.append(finding)
+                continue
+            findings.append(
+                finding.model_copy(
+                    update={
+                        "explanation": analysis.explanation,
+                        "potential_impact": analysis.potential_impact,
+                        "recommendation": analysis.recommendation,
+                        "missing_information": analysis.missing_information,
+                    }
+                )
+            )
+        return {"findings": findings}
+
 
 async def _optional_fetch(
     dependencies: AuditDependencies,
@@ -401,6 +553,52 @@ def _validate_page_selection(
         selected.append(page.model_copy(update={"url": normalized}))
         seen.add(normalized)
     return selected
+
+
+def _attach_verified_link_statuses(
+    page_signals: Mapping[str, PageSignals],
+) -> dict[str, PageSignals]:
+    statuses: dict[str, int] = {}
+    for key, page in page_signals.items():
+        if page.status_code is None:
+            continue
+        statuses[key] = page.status_code
+        statuses[page.url] = page.status_code
+        if page.final_url:
+            statuses[page.final_url] = page.status_code
+    updated: dict[str, PageSignals] = {}
+    for key, page in page_signals.items():
+        links = [
+            link.model_copy(update={"target_status_code": statuses.get(link.url)})
+            if link.url in statuses
+            else link
+            for link in page.internal_links
+        ]
+        updated[key] = page.model_copy(update={"internal_links": links})
+    return updated
+
+
+def _robots_permits(url: str, robots: RobotsSignals | None) -> bool:
+    """Apply the most specific observed wildcard/Googlebot robots rule."""
+    if robots is None or robots.available is not True:
+        return True
+    path = urlsplit(url).path or "/"
+    matching_rules = []
+    for rule in robots.rules:
+        if rule.user_agent not in {"*", "googlebot", "technicalseoauditagent"}:
+            continue
+        if not rule.path:
+            continue
+        expression = re.escape(rule.path).replace(r"\*", ".*")
+        if expression.endswith(r"\$"):
+            expression = f"{expression[:-2]}$"
+        if re.match(expression, path):
+            matching_rules.append(rule)
+    if not matching_rules:
+        return True
+    longest = max(len(rule.path) for rule in matching_rules)
+    most_specific = [rule for rule in matching_rules if len(rule.path) == longest]
+    return any(rule.directive is RobotsDirective.ALLOW for rule in most_specific)
 
 
 def _merge_strings(existing: Iterable[str], additions: Iterable[str]) -> list[str]:
