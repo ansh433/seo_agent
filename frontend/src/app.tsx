@@ -1,15 +1,45 @@
-/** Temporary application shell; replaced by the audit flow in commit 18. */
+import { useState } from "react";
+
+import { AuditApiError, createAudit } from "./api/audits";
+import { GeneratePage } from "./components/generate-page";
+import { ReportPage } from "./components/report-page";
+import type { AuditReport } from "./types/audit";
+
+/** Root application state for generating and reading one audit report. */
 export function App(): React.JSX.Element {
-  return (
-    <div className="min-h-screen bg-[#f6f7f3] text-[#0d1933]">
-      <main className="mx-auto w-full max-w-[76rem] px-5 py-16 sm:px-8">
-        <h1 className="font-display text-4xl font-bold tracking-[-0.035em]">
-          SiteIntel
-        </h1>
-        <p className="mt-3 text-base leading-7 text-[#5b6880]">
-          Evidence-backed technical SEO audits.
-        </p>
-      </main>
-    </div>
+  const [report, setReport] = useState<AuditReport | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleSubmit = async (websiteUrl: string): Promise<void> => {
+    if (isLoading) return;
+
+    setError(null);
+    setIsLoading(true);
+    try {
+      const auditReport = await createAudit(websiteUrl);
+      setReport(auditReport);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch (requestError: unknown) {
+      setError(
+        requestError instanceof AuditApiError
+          ? requestError.message
+          : "Something unexpected happened while running the audit. Please try again.",
+      );
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleStartOver = (): void => {
+    setReport(null);
+    setError(null);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  return report ? (
+    <ReportPage report={report} onStartOver={handleStartOver} />
+  ) : (
+    <GeneratePage error={error} isLoading={isLoading} onSubmit={(url) => void handleSubmit(url)} />
   );
 }
