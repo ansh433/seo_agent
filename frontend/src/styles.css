@@ -1,0 +1,91 @@
+@import "tailwindcss";
+
+:root {
+  color: #0d1933;
+  background: #f6f7f3;
+  font-family: "Manrope Variable", "Noto Sans", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-width: 320px;
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background: #f6f7f3;
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button,
+summary,
+a {
+  -webkit-tap-highlight-color: transparent;
+}
+
+summary::-webkit-details-marker {
+  display: none;
+}
+
+.font-display {
+  font-family: "Rasa", Georgia, serif;
+}
+
+.report-section {
+  break-inside: avoid;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms;
+    animation-iteration-count: 1;
+    scroll-behavior: auto;
+    transition-duration: 0.01ms;
+  }
+}
+
+@media print {
+  @page {
+    margin: 14mm;
+    size: A4;
+  }
+
+  body {
+    background: white;
+    color: #0d1933;
+  }
+
+  details > :not(summary) {
+    display: block;
+  }
+
+  .report-section {
+    break-inside: auto;
+    margin-block: 1.5rem;
+  }
+
+  article,
+  pre,
+  dl {
+    break-inside: avoid;
+  }
+}
