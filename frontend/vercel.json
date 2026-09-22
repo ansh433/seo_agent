@@ -1,0 +1,10 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist/client",
+  "rewrites": [
+    {
+      "source": "/audits",
+      "destination": "https://seo-agent-n2q6.onrender.com/audits"
+    }
+  ]
+}

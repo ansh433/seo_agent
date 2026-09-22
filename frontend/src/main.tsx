@@ -1,6 +1,4 @@
-import "@fontsource-variable/manrope";
-import "@fontsource/rasa/600.css";
-import "@fontsource/rasa/700.css";
+import "@fontsource-variable/inter";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 
